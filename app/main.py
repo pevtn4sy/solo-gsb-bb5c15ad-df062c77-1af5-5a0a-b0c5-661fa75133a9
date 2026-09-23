@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .mapping import AnchorError, PiecewiseMapping, build_anchors
-from .srt import Cue, SrtParseError, format_srt, parse_srt
+from .srt import SrtParseError, parse_srt, rewrite_srt
 from .timecode import format_signed_timecode, format_timecode
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -57,7 +57,7 @@ def index() -> FileResponse:
 
 @app.post("/api/correct", response_model=CorrectResponse)
 def correct(req: CorrectRequest) -> CorrectResponse | JSONResponse:
-    # 1. 解析 SRT（保留原始序号与文本）
+    # 1. 解析 SRT（保留原始序号与文本；无法解析仍返回 422）
     try:
         cues = parse_srt(req.srt)
     except SrtParseError as exc:
@@ -74,7 +74,7 @@ def correct(req: CorrectRequest) -> CorrectResponse | JSONResponse:
 
     mapping = PiecewiseMapping(anchors)
     warnings: list[str] = []
-    corrected: list[Cue] = []
+    new_ranges: list[tuple[int, int]] = []
 
     # 3. 逐条字幕做分段线性映射
     for cue in cues:
@@ -97,21 +97,25 @@ def correct(req: CorrectRequest) -> CorrectResponse | JSONResponse:
                 "该结果已保留但可能异常，请检查锚点。"
             )
 
-        corrected.append(
-            Cue(index=cue.index, start=new_start, end=new_end, text=cue.text)
-        )
+        new_ranges.append((new_start, new_end))
 
-    result_srt = format_srt(corrected)
+    # 4. 无损重写：只替换各时间轴行的起止时间码；序号、正文、箭头空格、
+    #    X1:/X2: 等定位参数、空行、原有换行及开头 BOM 全部保持原样
+    try:
+        result_srt = rewrite_srt(req.srt, new_ranges)
+    except SrtParseError as exc:
+        raise HTTPException(status_code=422, detail={"type": "srt", "message": str(exc)})
+
     cue_views = [
         CorrectedCue(
-            index=c.index,
-            original_start=format_timecode(o.start),
-            original_end=format_timecode(o.end),
-            corrected_start=format_timecode(c.start),
-            corrected_end=format_timecode(c.end),
-            text=c.text,
+            index=cue.index,
+            original_start=format_timecode(cue.start),
+            original_end=format_timecode(cue.end),
+            corrected_start=format_timecode(new_start),
+            corrected_end=format_timecode(new_end),
+            text=cue.text,
         )
-        for o, c in zip(cues, corrected)
+        for cue, (new_start, new_end) in zip(cues, new_ranges)
     ]
 
     return CorrectResponse(corrected_srt=result_srt, cues=cue_views, warnings=warnings)

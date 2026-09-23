@@ -284,8 +284,9 @@
         return;
       }
 
+      // 页面预览与下载共用同一份服务器返回的 corrected_srt
       window.__correctedSrt = data.corrected_srt;
-      previewEl.textContent = data.corrected_srt;
+      previewEl.textContent = window.__correctedSrt;
       cueTableEl.innerHTML = data.cues.map(c =>
         "<tr>" +
         '<td class="num">' + escapeHtml(c.index) + "</td>" +
@@ -312,8 +313,10 @@
   });
 
   document.getElementById("download").addEventListener("click", () => {
+    // 预览与下载使用同一份服务器返回：服务端仅替换时间码，
+    // 原文件带 BOM 时保留唯一一个 BOM，这里不再额外添加，避免重复。
     const content = window.__correctedSrt || "";
-    const blob = new Blob(["﻿" + content], { type: "application/x-subrip;charset=utf-8" });
+    const blob = new Blob([content], { type: "application/x-subrip;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;

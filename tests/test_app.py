@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.mapping import AnchorError, PiecewiseMapping, build_anchors
-from app.srt import SrtParseError, format_srt, parse_srt
+from app.srt import BOM, SrtParseError, format_srt, parse_srt, rewrite_srt
 from app.timecode import format_timecode, parse_timecode
 
 client = TestClient(app)
@@ -67,6 +67,87 @@ def test_roundtrip_srt():
     out = format_srt(parse_srt(SAMPLE))
     assert "00:00:05,000 --> 00:00:08,000" in out
     assert "第二行上\n第二行下" in out
+
+
+# ---------- 无损重写 ----------
+
+POS_SAMPLE = (
+    BOM
+    + "1\r\n"
+    + "  00:00:05,000 --> 00:00:08,000  X1:10 X2:630 Y1:20 Y2:60\r\n"
+    + "你好\r\n"
+    + "\r\n"
+    + "2\r\n"
+    + "00:00:10,000\t-->\t00:00:12,500  Position:50%,30%,0\r\n"
+    + "第二行上\r\n第二行下\r\n"
+)
+
+
+def test_rewrite_identity_is_byte_identical():
+    # 恒等锚点：除时间码按规范重写外，其余内容（BOM/CRLF/参数/箭头空格）逐字节不动
+    cues = parse_srt(POS_SAMPLE)
+    out = rewrite_srt(POS_SAMPLE, [(c.start, c.end) for c in cues])
+    assert out == POS_SAMPLE
+
+
+def test_rewrite_only_touches_timing_timecodes():
+    cues = parse_srt(POS_SAMPLE)
+    out = rewrite_srt(POS_SAMPLE, [(1_000, 4_000), (6_000, 8_500)])
+
+    # 开头 BOM 唯一保留
+    assert out.startswith(BOM)
+    assert BOM not in out[1:]  # 正文内没有额外 BOM
+
+    # 原有 CRLF 换行、定位参数、箭头前后空格全部保留
+    assert (
+        "  00:00:01,000 --> 00:00:04,000  X1:10 X2:630 Y1:20 Y2:60\r\n"
+    ) in out
+    assert (
+        "00:00:06,000\t-->\t00:00:08,500  Position:50%,30%,0\r\n"
+    ) in out
+
+    # 序号与正文原样
+    assert "1\r\n" in out
+    assert "你好\r\n" in out
+    assert "第二行上\r\n第二行下\r\n" in out
+
+    # 旧时间码不再残留
+    assert "00:00:05,000" not in out
+    assert "00:00:12,500" not in out
+
+
+def test_rewrite_preserves_blank_lines_and_lf():
+    src = (
+        "1\n00:00:05,000 --> 00:00:08,000\n第一句\n"
+        "\n"
+        "\n"  # 多余空行也保留
+        "2\n00:00:10,000 --> 00:00:12,500 X1:1\r\n第二句\n"
+    )
+    cues = parse_srt(src)
+    out = rewrite_srt(src, [(0, 1_000), (2_000, 3_000)])
+    assert out.count("\r") == 1  # 仅第二块原有的那个 CR 保留，其余仍是 LF
+    assert out.startswith("1\n00:00:00,000 --> 00:00:01,000\n第一句\n\n\n2\n")
+    assert out.endswith("00:00:02,000 --> 00:00:03,000 X1:1\r\n第二句\n")
+
+
+def test_rewrite_without_bom_stays_bomless():
+    src = "1\n00:00:05,000 --> 00:00:08,000\n你好\n"
+    out = rewrite_srt(src, [(1_000, 2_000)])
+    assert not out.startswith(BOM)
+    assert out == "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+
+
+def test_rewrite_collapses_multiple_leading_boms_to_one():
+    src = BOM + BOM + "1\n00:00:05,000 --> 00:00:08,000\n你好\n"
+    cues = parse_srt(src)
+    assert len(cues) == 1
+    out = rewrite_srt(src, [(1_000, 2_000)])
+    assert out == BOM + "1\n00:00:01,000 --> 00:00:02,000\n你好\n"
+
+
+def test_rewrite_invalid_srt_raises():
+    with pytest.raises(SrtParseError):
+        rewrite_srt("garbage without timing", [(1_000, 2_000)])
 
 
 # ---------- 锚点与映射 ----------
@@ -173,6 +254,45 @@ def test_api_correct_success():
         _mapping().map_ms(5000)
     )
     assert "你好" in data["corrected_srt"]
+
+
+def test_api_lossless_preserves_bom_crlf_and_positioning():
+    src = (
+        BOM
+        + "1\r\n"
+        + "00:00:05,000 --> 00:00:08,000 X1:10 X2:630\r\n"
+        + "你好\r\n\r\n"
+        + "2\r\n"
+        + "00:00:10,000 --> 00:00:12,500\r\n"
+        + "第二行\r\n"
+    )
+    body = {
+        "srt": src,
+        "anchors": [
+            {"original": "00:00:05,000", "corrected": "00:00:05,000"},
+            {"original": "00:00:10,000", "corrected": "00:00:10,000"},
+        ],
+    }
+    resp = client.post("/api/correct", json=body)
+    assert resp.status_code == 200, resp.text
+    # 恒等锚点下，返回体应与输入逐字符一致（BOM/CRLF/定位参数均无损）
+    assert resp.json()["corrected_srt"] == src
+
+
+def test_api_bomless_input_returns_bomless_srt():
+    src = "1\n00:00:05,000 --> 00:00:08,000 X1:10\n你好\n"
+    body = {
+        "srt": src,
+        "anchors": [
+            {"original": "00:00:05,000", "corrected": "00:00:06,000"},
+            {"original": "00:00:10,000", "corrected": "00:00:11,000"},
+        ],
+    }
+    resp = client.post("/api/correct", json=body)
+    assert resp.status_code == 200, resp.text
+    out = resp.json()["corrected_srt"]
+    assert not out.startswith(BOM)
+    assert out == "1\n00:00:06,000 --> 00:00:09,000 X1:10\n你好\n"
 
 
 def test_api_rejects_bad_anchors_with_reason():
