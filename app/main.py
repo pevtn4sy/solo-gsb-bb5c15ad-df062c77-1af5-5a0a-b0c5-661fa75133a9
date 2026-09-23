@@ -8,7 +8,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .mapping import AnchorError, PiecewiseMapping, build_anchors
-from .srt import Cue, SrtParseError, format_srt, parse_srt
+from .srt import Cue, SrtParseError, parse_srt, rewrite_srt_timings
 from .timecode import format_signed_timecode, format_timecode
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -101,7 +101,9 @@ def correct(req: CorrectRequest) -> CorrectResponse | JSONResponse:
             Cue(index=cue.index, start=new_start, end=new_end, text=cue.text)
         )
 
-    result_srt = format_srt(corrected)
+    # 4. 在原始文本上就地替换各时间轴行的时间码：
+    #    序号、正文、箭头空格、定位参数、空行、换行符与 BOM 均保持原样
+    result_srt = rewrite_srt_timings(req.srt, [(cue.start, cue.end) for cue in corrected])
     cue_views = [
         CorrectedCue(
             index=c.index,

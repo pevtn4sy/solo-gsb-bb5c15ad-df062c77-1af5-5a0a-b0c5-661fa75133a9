@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from app.mapping import AnchorError, PiecewiseMapping, build_anchors
-from app.srt import SrtParseError, format_srt, parse_srt
+from app.srt import SrtParseError, format_srt, parse_srt, rewrite_srt_timings
 from app.timecode import format_timecode, parse_timecode
 
 client = TestClient(app)
@@ -67,6 +67,82 @@ def test_roundtrip_srt():
     out = format_srt(parse_srt(SAMPLE))
     assert "00:00:05,000 --> 00:00:08,000" in out
     assert "第二行上\n第二行下" in out
+
+
+# ---------- 无损导出（就地替换时间码） ----------
+
+POSITIONED_SRT = (
+    "﻿1\r\n"
+    "00:00:05,000 --> 00:00:08,000 X1:100 X2:500 Y1:20 Y2:60\r\n"
+    "你好\r\n"
+    "\r\n"
+    "2\r\n"
+    "00:00:10,000  -->  00:00:12,500 position:50%\r\n"
+    "第二行上\r\n第二行下\r\n"
+)
+
+
+def test_rewrite_preserves_bom_crlf_and_positioning_params():
+    cues = parse_srt(POSITIONED_SRT)
+    timings = [(cue.start + 1000, cue.end + 1000) for cue in cues]
+    assert rewrite_srt_timings(POSITIONED_SRT, timings) == (
+        "﻿1\r\n"
+        "00:00:06,000 --> 00:00:09,000 X1:100 X2:500 Y1:20 Y2:60\r\n"
+        "你好\r\n"
+        "\r\n"
+        "2\r\n"
+        "00:00:11,000  -->  00:00:13,500 position:50%\r\n"
+        "第二行上\r\n第二行下\r\n"
+    )
+
+
+def test_rewrite_preserves_arrow_spacing_and_blank_lines():
+    src = (
+        "1\n"
+        "00:00:01,000-->00:00:02,000\n"
+        "紧凑箭头\n"
+        "\n\n\n"
+        "2\n"
+        "00:00:03,000 -->   00:00:04,000\n"
+        "稀疏箭头\n"
+    )
+    cues = parse_srt(src)
+    timings = [(cue.start + 500, cue.end + 500) for cue in cues]
+    assert rewrite_srt_timings(src, timings) == (
+        "1\n"
+        "00:00:01,500-->00:00:02,500\n"
+        "紧凑箭头\n"
+        "\n\n\n"
+        "2\n"
+        "00:00:03,500 -->   00:00:04,500\n"
+        "稀疏箭头\n"
+    )
+
+
+def test_rewrite_ignores_timing_like_text_lines():
+    # 正文里恰好形如时间轴的行不是时间轴行，不应被改写
+    src = (
+        "1\n"
+        "00:00:01,000 --> 00:00:02,000\n"
+        "00:09:09,000 --> 00:09:10,000\n"
+    )
+    cues = parse_srt(src)
+    out = rewrite_srt_timings(src, [(cues[0].start + 1000, cues[0].end + 1000)])
+    assert out == (
+        "1\n"
+        "00:00:02,000 --> 00:00:03,000\n"
+        "00:09:09,000 --> 00:09:10,000\n"
+    )
+
+
+def test_rewrite_count_mismatch_rejected():
+    with pytest.raises(SrtParseError):
+        rewrite_srt_timings("1\n00:00:01,000 --> 00:00:02,000\n甲\n", [])
+    with pytest.raises(SrtParseError):
+        rewrite_srt_timings(
+            "1\n00:00:01,000 --> 00:00:02,000\n甲\n",
+            [(0, 1000), (2000, 3000)],
+        )
 
 
 # ---------- 锚点与映射 ----------
@@ -190,3 +266,22 @@ def test_api_rejects_bad_srt():
     resp = client.post("/api/correct", json=body)
     assert resp.status_code == 422
     assert resp.json()["detail"]["type"] == "srt"
+
+
+def test_api_correct_lossless_export():
+    body = request_body()
+    body["srt"] = POSITIONED_SRT
+    resp = client.post("/api/correct", json=body)
+    assert resp.status_code == 200, resp.text
+    out = resp.json()["corrected_srt"]
+
+    # 仅时间码被替换为映射结果，BOM、CRLF、定位参数、箭头空格全部原样保留
+    m = _mapping()
+    expected = POSITIONED_SRT.replace(
+        "00:00:05,000 --> 00:00:08,000",
+        f"{format_timecode(m.map_ms(5000))} --> {format_timecode(m.map_ms(8000))}",
+    ).replace(
+        "00:00:10,000  -->  00:00:12,500",
+        f"{format_timecode(m.map_ms(10000))}  -->  {format_timecode(m.map_ms(12500))}",
+    )
+    assert out == expected

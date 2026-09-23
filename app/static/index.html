@@ -313,7 +313,10 @@
 
   document.getElementById("download").addEventListener("click", () => {
     const content = window.__correctedSrt || "";
-    const blob = new Blob(["﻿" + content], { type: "application/x-subrip;charset=utf-8" });
+    // 下载与页面预览使用同一份结果；结果可能已沿用原文件的 BOM，
+    // 只在缺少时补一个，保证下载文件开头最多一个 BOM。
+    const bom = content.startsWith("\ufeff") ? "" : "\ufeff";
+    const blob = new Blob([bom + content], { type: "application/x-subrip;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
